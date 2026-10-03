@@ -61,3 +61,62 @@
 | `docs`     | Документация                    | `docs: add API examples`            |
 | `test`     | Тесты                           | `test: cover edge cases`            |
 | `chore`    | Зависимости, конфиги, сборка    | `chore: update eslint`              |
+
+
+
+
+### Префиксы веток
+
+| Префикс | Для чего |
+|---------|----------|
+| `feature/` | Новая функциональность |
+| `fix/` | Исправление бага |
+| `hotfix/` | Срочный фикс в проде |
+| `refactor/` | Рефакторинг |
+| `docs/` | Документация |
+| `chore/` | Рутина, зависимости |
+| `release/` | Подготовка релиза |
+
+### Примеры
+```
+feature/user-login
+
+fix/142-memory-leak
+
+hotfix/payment-crash
+
+docs/api-examples
+
+chore/bump-deps
+```
+
+
+### Правила
+- С маленькой буквы, слова через дефис
+- Кратко и описательно: `fix/login-error`, не `fix`
+- Номер задачи, если есть трекер: `feature/JIRA-1234-auth`
+
+---
+
+## 🔄 Рабочий процесс
+
+```bash
+# 1. Обновить main
+git checkout main
+git pull
+
+# 2. Создать ветку под задачу
+git checkout -b feature/user-login
+
+# 3. Работать и коммитить
+git add .
+git commit -m "feat(auth): add login form"
+
+# 4. Запушить
+git push -u origin feature/user-login
+
+# 5. Создать Pull Request
+
+# 6. После мержа — удалить ветку
+git branch -d feature/user-login
+git push origin --delete feature/user-login

@@ -358,4 +358,565 @@ POST /api/auth/change-password/
 | `UserUpdateSerializer`       | Обновление профиля     | `PATCH /api/auth/profile/update/` |
 | `ChangePasswordSerializer`   | Смена пароля           | `POST /api/auth/change-password/` |
 
-**Следующий этап:** Views + URLs для сериализаторов, затем JWT-настройка (`djangorestframework-simplejwt`) и Vue-часть.
+**Следующий этап:** Views.
+
+---
+Используем классовые представления в данном случае вместо функциональных. Можно было и функциональным стилем обойтись но
+мы будем идти через классовый формат.
+
+# 📘 Django (DRF) + Vue — Шаблон для Views (классовый стиль)
+
+> Ниже — **универсальный модульный шаблон** для написания class-based views.  
+> Каждый блок можно **включать/отключать** по ситуации (доступ, фильтрация, сериализаторы и т.д.).
+
+---
+
+## 🔹 Базовый каркас (всегда присутствует)
+
+```python
+from rest_framework import generics, permissions, status
+from rest_framework.response import Response
+
+from .models import ModelName
+from .serializers import ModelNameSerializer
+
+
+class ModelNameView(generics.GenericAPIView):
+    """Краткое описание view"""
+
+    # ─────────────────────────────────────────
+    # 1. QUERYSET — какие данные берём из БД
+    # ─────────────────────────────────────────
+    queryset = ModelName.objects.all()
+
+    # ─────────────────────────────────────────
+    # 2. SERIALIZER — как отдаём/принимаем данные
+    # ─────────────────────────────────────────
+    serializer_class = ModelNameSerializer
+
+    # ─────────────────────────────────────────
+    # 3. PERMISSIONS — кто имеет доступ
+    # ─────────────────────────────────────────
+    permission_classes = [permissions.IsAuthenticated]
+
+    # ─────────────────────────────────────────
+    # 4. HTTP METHODS — какие методы обрабатываем
+    # ─────────────────────────────────────────
+    def get(self, request, *args, **kwargs):
+        ...
+```
+
+---
+
+## 🔹 Модуль 1. Выбор generic-класса (что делает endpoint)
+
+Выберите **один** базовый класс под задачу:
+
+| Класс                                   | HTTP                 | Что делает            | Когда использовать          |
+|-----------------------------------------|----------------------|-----------------------|-----------------------------|
+| `generics.ListAPIView`                  | GET                  | Список объектов       | Показать все записи         |
+| `generics.CreateAPIView`                | POST                 | Создание объекта      | Регистрация, добавление     |
+| `generics.RetrieveAPIView`              | GET                  | Один объект по ID     | Профиль, детальная страница |
+| `generics.UpdateAPIView`                | PUT/PATCH            | Обновление            | Редактирование              |
+| `generics.DestroyAPIView`               | DELETE               | Удаление              | Удалить запись              |
+| `generics.ListCreateAPIView`            | GET+POST             | Список + создание     | Лента + публикация          |
+| `generics.RetrieveUpdateAPIView`        | GET+PUT+PATCH        | Просмотр + обновление | Профиль                     |
+| `generics.RetrieveDestroyAPIView`       | GET+DELETE           | Просмотр + удаление   | Удаление из списка          |
+| `generics.RetrieveUpdateDestroyAPIView` | GET+PUT+PATCH+DELETE | Полный CRUD           | Админка                     |
+
+**Пример выбора:**
+
+```python
+# Если нужен только список:
+class UserListView(generics.ListAPIView):
+
+
+# Если список + создание:
+class PostListCreateView(generics.ListCreateAPIView):
+
+
+# Если один объект + редактирование:
+class ProfileView(generics.RetrieveUpdateAPIView):
+```
+
+---
+
+## 🔹 Модуль 2. Настройка доступа (`permission_classes`)
+
+Выберите **один или несколько** вариантов:
+
+```python
+from rest_framework import permissions
+
+# ─────────────────────────────────────────────
+# Вариант A: Доступ для всех (регистрация, логин)
+# ─────────────────────────────────────────────
+permission_classes = [permissions.AllowAny]
+
+# ─────────────────────────────────────────────
+# Вариант B: Только авторизованные (профиль)
+# ─────────────────────────────────────────────
+permission_classes = [permissions.IsAuthenticated]
+
+# ─────────────────────────────────────────────
+# Вариант C: Только админы
+# ─────────────────────────────────────────────
+permission_classes = [permissions.IsAdminUser]
+
+# ─────────────────────────────────────────────
+# Вариант D: Только чтение для всех, запись для авторизованных
+# ─────────────────────────────────────────────
+permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+
+
+# ─────────────────────────────────────────────
+# Вариант E: Своё правило (только владелец объекта)
+# ─────────────────────────────────────────────
+class IsOwnerOrReadOnly(permissions.BasePermission):
+    def has_object_permission(self, request, view, obj):
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        return obj.author == request.user
+
+
+permission_classes = [permissions.IsAuthenticated, IsOwnerOrReadOnly]
+
+
+# ─────────────────────────────────────────────
+# Вариант F: Только определённая группа
+# ─────────────────────────────────────────────
+class IsManager(permissions.BasePermission):
+    def has_permission(self, request, view):
+        if not request.user.is_authenticated:
+            return False
+        return request.user.groups.filter(name='Manager').exists()
+
+
+permission_classes = [IsManager]
+```
+
+---
+
+## 🔹 Модуль 3. Динамический queryset (фильтрация, поиск)
+
+**Когда использовать:** нужно фильтровать данные по параметрам запроса или пользователю.
+
+```python
+class PostListView(generics.ListAPIView):
+    serializer_class = PostSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        # Базовый queryset
+        queryset = Post.objects.all()
+
+        # ─────────────────────────────────────────
+        # Фильтр 1: только опубликованные
+        # ─────────────────────────────────────────
+        queryset = queryset.filter(is_published=True)
+
+        # ─────────────────────────────────────────
+        # Фильтр 2: по параметру из URL (?category=tech)
+        # ─────────────────────────────────────────
+        category = self.request.query_params.get('category')
+        if category:
+            queryset = queryset.filter(category=category)
+
+        # ─────────────────────────────────────────
+        # Фильтр 3: только свои записи
+        # ─────────────────────────────────────────
+        if self.request.query_params.get('my') == 'true':
+            queryset = queryset.filter(author=self.request.user)
+
+        # ─────────────────────────────────────────
+        # Сортировка
+        # ─────────────────────────────────────────
+        return queryset.order_by('-created_at')
+```
+
+---
+
+## 🔹 Модуль 4. Динамический сериализатор (разные данные для разных ролей)
+
+**Когда использовать:** админ видит одно, обычный пользователь — другое.
+
+```python
+class UserDetailView(generics.RetrieveAPIView):
+    queryset = User.objects.all()
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_serializer_class(self):
+        # ─────────────────────────────────────────
+        # Админ получает полные данные
+        # ─────────────────────────────────────────
+        if self.request.user.is_staff:
+            return UserFullSerializer
+
+        # ─────────────────────────────────────────
+        # Обычный пользователь — базовые данные
+        # ─────────────────────────────────────────
+        return UserPublicSerializer
+```
+
+---
+
+## 🔹 Модуль 5. Хуки создания/обновления/удаления
+
+**Когда использовать:** нужно добавить логику при сохранении (например, привязать автора).
+
+```python
+class PostCreateView(generics.CreateAPIView):
+    queryset = Post.objects.all()
+    serializer_class = PostSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    # ─────────────────────────────────────────
+    # Вызывается при создании
+    # ─────────────────────────────────────────
+    def perform_create(self, serializer):
+        serializer.save(author=self.request.user)
+
+    # ─────────────────────────────────────────
+    # Вызывается при обновлении
+    # ─────────────────────────────────────────
+    def perform_update(self, serializer):
+        instance = serializer.save()
+        send_email_confirmation(instance)
+
+    # ─────────────────────────────────────────
+    # Вызывается при удалении
+    # ─────────────────────────────────────────
+    def perform_destroy(self, instance):
+        instance.is_deleted = True
+        instance.save()
+```
+
+---
+
+## 🔹 Модуль 6. Переопределение ответа (своя структура JSON)
+
+**Когда использовать:** нужно добавить поля в ответ (токены, сообщения).
+
+```python
+class RegisterView(generics.CreateAPIView):
+    queryset = User.objects.all()
+    serializer_class = UserRegistrationSerializer
+    permission_classes = [permissions.AllowAny]
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+
+        # ─────────────────────────────────────────
+        # Дополнительная логика
+        # ─────────────────────────────────────────
+        refresh = RefreshToken.for_user(user)
+
+        # ─────────────────────────────────────────
+        # Свой формат ответа
+        # ─────────────────────────────────────────
+        return Response({
+            'user': UserProfileSerializer(user).data,
+            'refresh': str(refresh),
+            'access': str(refresh.access_token),
+            'message': 'User registered successfully'
+        }, status=status.HTTP_201_CREATED)
+```
+
+---
+
+## 🔹 Модуль 7. Кастомный lookup (поиск по другому полю)
+
+**Когда использовать:** объект ищется не по `pk`, а по `slug` или `email`.
+
+```python
+class PostDetailView(generics.RetrieveAPIView):
+    queryset = Post.objects.all()
+    serializer_class = PostSerializer
+
+    # ─────────────────────────────────────────
+    # Ищем по slug, а не по pk
+    # ─────────────────────────────────────────
+    lookup_field = 'slug'
+```
+
+---
+
+## 🔹 Модуль 8. Пагинация
+
+**Когда использовать:** длинные списки.
+
+```python
+class PostListView(generics.ListAPIView):
+    queryset = Post.objects.all()
+    serializer_class = PostSerializer
+    permission_classes = [permissions.AllowAny]
+
+    # ─────────────────────────────────────────
+    # Включаем пагинацию
+    # ─────────────────────────────────────────
+    pagination_class = PageNumberPagination
+    # или свой класс:
+    # pagination_class = CustomPagination
+```
+
+**Настройка в `settings.py`:**
+
+```python
+REST_FRAMEWORK = {
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 10
+}
+```
+
+---
+
+## 🔹 Модуль 9. Аутентификация (для APIView)
+
+**Когда использовать:** не стандартный JWT, а Token или Session.
+
+```python
+from rest_framework import authentication
+
+
+class CustomAuthView(generics.GenericAPIView):
+    # ─────────────────────────────────────────
+    # Кастомная аутентификация
+    # ─────────────────────────────────────────
+    authentication_classes = [authentication.TokenAuthentication]
+    permission_classes = [permissions.IsAuthenticated]
+```
+
+**Варианты:**
+
+- `[authentication.TokenAuthentication]` — токен в заголовке
+- `[authentication.SessionAuthentication]` — сессия Django
+- `[JWTAuthentication]` — JWT (по умолчанию, если настроен)
+
+---
+
+## 🔹 Модуль 10. Кастомные методы API (не CRUD)
+
+**Когда использовать:** нестандартное действие (`POST /users/1/activate/`).
+
+```python
+from rest_framework.decorators import action
+from rest_framework import viewsets
+
+
+class UserViewSet(viewsets.ModelViewSet):
+    queryset = User.objects.all()
+    serializer_class = UserSerializer
+
+    # ─────────────────────────────────────────
+    # POST /users/{id}/activate/
+    # ─────────────────────────────────────────
+    @action(detail=True, methods=['post'])
+    def activate(self, request, pk=None):
+        user = self.get_object()
+        user.is_active = True
+        user.save()
+        return Response({'status': 'activated'})
+```
+
+---
+
+## 🎯 Полный пример: модульный view
+
+```python
+# ─────────────────────────────────────────────
+# ИМПОРТЫ
+# ─────────────────────────────────────────────
+from rest_framework import generics, permissions, status
+from rest_framework.response import Response
+
+from .models import Post
+from .serializers import PostSerializer, PostCreateSerializer
+
+
+# ─────────────────────────────────────────────
+# КЛАСС: Список + создание
+# ─────────────────────────────────────────────
+class PostListCreateView(generics.ListCreateAPIView):
+    """Список постов + создание нового"""
+
+    # ─────────────────────────────────────────
+    # QUERYSET (можно переопределить в get_queryset)
+    # ─────────────────────────────────────────
+    queryset = Post.objects.all()
+
+    # ─────────────────────────────────────────
+    # PERMISSIONS: чтение всем, запись авторизованным
+    # ─────────────────────────────────────────
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+
+    # ─────────────────────────────────────────
+    # SERIALIZER: динамический по методу
+    # ─────────────────────────────────────────
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return PostCreateSerializer
+        return PostSerializer
+
+    # ─────────────────────────────────────────
+    # QUERYSET: фильтрация
+    # ─────────────────────────────────────────
+    def get_queryset(self):
+        queryset = Post.objects.filter(is_published=True)
+
+        category = self.request.query_params.get('category')
+        if category:
+            queryset = queryset.filter(category=category)
+
+        return queryset.order_by('-created_at')
+
+    # ─────────────────────────────────────────
+    # HOOK: привязка автора при создании
+    # ─────────────────────────────────────────
+    def perform_create(self, serializer):
+        serializer.save(author=self.request.user)
+```
+
+---
+
+## 📚 Ссылки на документацию
+
+| Тема                           | Django                                                                                                         | DRF                                                                                                                |
+|--------------------------------|----------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------|
+| **Class-based views (основы)** | [Django Docs](https://docs.djangoproject.com/en/6.0/topics/class-based-views/)                                 | [DRF Views](https://www.django-rest-framework.org/api-guide/views/)                                                |
+| **Generic views**              | [Django Built-in CBV API](https://docs.djangoproject.com/en/5.2/ref/class-based-views/)                        | [DRF Generic Views](https://www.django-rest-framework.org/api-guide/generic-views/)                                |
+| **Mixins**                     | [Using mixins](https://docs.djangoproject.com/en/6.0/topics/class-based-views/mixins/)                         | [DRF Mixins (GitHub)](https://github.com/encode/django-rest-framework/blob/master/docs/api-guide/generic-views.md) |
+| **Permissions**                | [Django Permissions](https://docs.djangoproject.com/en/5.2/topics/auth/default/#permissions-and-authorization) | [DRF Permissions](https://www.django-rest-framework.org/api-guide/permissions/)                                    |
+| **Authentication**             | [Django Auth](https://docs.djangoproject.com/en/5.2/topics/auth/)                                              | [DRF Authentication](https://www.django-rest-framework.org/api-guide/authentication/)                              |
+| **Pagination**                 | —                                                                                                              | [DRF Pagination](https://www.django-rest-framework.org/api-guide/pagination/)                                      |
+
+**Полезный ресурс:** [Classy DRF](https://ccbv.co.uk/) — интерактивный справочник по всем CBV Django и DRF.
+
+---
+
+**Следующий этап:** URLs — связываем views с endpoint'ами через `path()` и `as_view()`.
+
+## В моём случае итоговый код стал следующим
+
+---
+
+## 🔹 `RegisterView`
+
+```python
+class RegisterView(generics.CreateAPIView):
+    """Регистрация нового пользователя"""
+    queryset = User.objects.all()  # Берём всех пользователей из БД (нужно для внутренних механизмов DRF)
+    serializer_class = UserRegistrationSerializer  # Какой сериализатор использовать
+    permission_classes = [permissions.AllowAny]  # Доступ всем (регистрация открыта)
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)  # Получаем данные в сериализаторе
+        serializer.is_valid(raise_exception=True)  # Проверяем через validator нет ли ошибок
+        user = serializer.save()  # Сохраняем данные обращаясь к объекту пользователя 'user'
+        # через умный метод DRF serializer.save()
+
+        refresh = RefreshToken.for_user(user)  # Записываем в переменную refresh наш токен,
+        # который мы привязываем под нашего user
+
+        # Далее идёт ответ словарь по формату который мы укажем и с токеном
+        return Response({
+            'user': UserProfileSerializer(user).data,  # Данные пользователя по сериализатору которые указали показывать
+            'refresh': str(refresh),  # Знакомый нам токен который мы прописали
+            'access': str(refresh.access_token),  # Встроенный метод из refresh используем
+            # (refresh.access_token — уникальные токены для ОДНОГО пользователя конкретно)
+            'message': 'User registered successfully'
+        }, status=status.HTTP_201_CREATED)  # 201 — объект создан
+```
+
+---
+
+## 🔹 `LoginView`
+
+```python
+class LoginView(generics.GenericAPIView):
+    """Вход пользователя"""
+    serializer_class = UserLoginSerializer  # Сериализатор для проверки email + пароля
+    permission_classes = [permissions.AllowAny]  # Доступ всем (вход открыт)
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)  # Получаем данные в сериализаторе
+        serializer.is_valid(raise_exception=True)  # Проверяем нет ли ошибок
+        user = serializer.validated_data['user']  # Достаём user из проверенных данных
+        # (сериализатор положил его туда в validate())
+
+        login(request, user)  # Логиним пользователя в Django-сессии
+        refresh = RefreshToken.for_user(user)  # Генерируем refresh-токен под user
+
+        return Response({
+            'user': UserProfileSerializer(user).data,  # Данные пользователя по сериализатору
+            'refresh': str(refresh),  # Refresh-токен
+            'access': str(refresh.access_token),  # Access-токен из refresh
+            'message': 'User login successfully'
+        }, status=status.HTTP_200_OK)  # 200 — успешный вход
+```
+
+---
+
+## 🔹 `ProfileView`
+
+```python
+class ProfileView(generics.RetrieveUpdateAPIView):
+    """Просмотр и обновление профиля"""
+    serializer_class = UserProfileSerializer  # Сериализатор по умолчанию
+    permission_classes = [permissions.IsAuthenticated]  # Только авторизованные
+
+    def get_object(self):
+        return self.request.user  # Возвращаем текущего пользователя (а не по pk из URL)
+
+    def get_serializer_class(self):
+        if self.request.method == 'PUT' or self.request.method == 'PATCH':  # Если обновление
+            return UserUpdateSerializer  # Используем сериализатор обновления
+        return UserProfileSerializer  # Иначе — сериализатор просмотра
+```
+
+---
+
+## 🔹 `ChangePasswordView`
+
+```python
+class ChangePasswordView(generics.UpdateAPIView):
+    """Смена пароля"""
+    serializer_class = ChangePasswordSerializer  # Сериализатор смены пароля
+    permission_classes = [permissions.IsAuthenticated]  # Только авторизованные
+
+    def get_object(self):
+        return self.request.user  # Меняем пароль текущему пользователю
+
+    def update(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)  # Получаем данные в сериализаторе
+        serializer.is_valid(raise_exception=True)  # Проверяем нет ли ошибок
+        serializer.save()  # Сохраняем (внутри — set_password + save)
+
+        return Response({
+            'message': 'Password changed successfully'
+        }, status=status.HTTP_200_OK)  # 200 — пароль изменён
+```
+
+---
+
+## 🔹 `logout_view`
+
+```python
+@api_view(['POST'])  # Функциональный view, только POST
+@permission_classes([permissions.IsAuthenticated])  # Только авторизованные
+def logout_view(request):
+    """Выход пользователя"""
+    try:
+        refresh_token = request.data.get('refresh_token')  # Достаём refresh-токен из тела запроса
+        if refresh_token:
+            token = RefreshToken(refresh_token)  # Создаём объект токена
+            token.blacklist()  # Добавляем в blacklist (токен больше нельзя использовать)
+        return Response({
+            'message': 'Logout successful'
+        }, status=status.HTTP_200_OK)  # 200 — успешный выход
+    except Exception:
+        return Response({
+            'error': 'Invalid token'
+        }, status=status.HTTP_400_BAD_REQUEST)  # 400 — токен невалидный
+```

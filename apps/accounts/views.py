@@ -1,3 +1,111 @@
-from django.shortcuts import render
+from django.contrib.auth import login
+from rest_framework import status, generics, permissions
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.response import Response
+from rest_framework_simplejwt.tokens import RefreshToken
 
-# Create your views here.
+from .models import User
+from .serializers import (
+    UserRegistrationSerializer,
+    UserLoginSerializer,
+    UserProfileSerializer,
+    UserUpdateSerializer,
+    ChangePasswordSerializer
+)
+
+
+class RegisterView(generics.CreateAPIView):
+    """Регистрация нового пользователя"""
+    queryset = User.objects.all()
+    serializer_class = UserRegistrationSerializer
+    permission_classes = [permissions.AllowAny]
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)  # Получаем данные в сериализаторе
+        serializer.is_valid(raise_exception=True)  # Проверяем через validator нет ли ошибок
+        user = serializer.save()  # сохраняем данные обращаясь к объекту
+        # пользователя 'user' через умный метод DRF serializer.save()
+
+        refresh = RefreshToken.for_user(user)  # запсываем в переменную refresh наш
+        # токен который мы довязываем под нашего user
+
+        # Далее идёт ответ словарь по формату который мы укажем и с токеном
+        return Response({
+            'user': UserProfileSerializer(user).data,  # Данные пользователя по сериализатору которые указали показывать
+            'refresh': str(refresh),  # знакомый нам токен который мы прописали
+            'access': str(refresh.access_token),
+            # Встроенный метод из refresh используем
+            # (refresh.access_token Уникальные токены для ОДНОГО пользователя конкретно)
+            'message': 'User regirstered successfully'
+        }, status=status.HTTP_201_CREATED)
+
+
+class LoginView(generics.GenericAPIView):
+    """Вход пользователя"""
+    serializer_class = UserLoginSerializer
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.validated_data['user']
+
+        login(request, user)
+        refresh = RefreshToken.for_user(user)
+
+        return Response({
+            'user': UserProfileSerializer(user).data,
+            'refresh': str(refresh),
+            'access': str(refresh.access_token),
+            'message': 'User login successfully'
+        }, status=status.HTTP_200_OK)
+
+
+class ProfileView(generics.RetrieveUpdateAPIView):
+    """Просмотр и обновление профиля"""
+    serializer_class = UserProfileSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_object(self):
+        return self.request.user
+
+    def get_serializer_class(self):
+        if self.request.method == 'PUT' or self.request.method == 'PATCH':
+            return UserUpdateSerializer
+        return UserProfileSerializer
+
+
+class ChangePasswordView(generics.UpdateAPIView):
+    """Смена пароля"""
+    serializer_class = ChangePasswordSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_object(self):
+        return self.request.user
+
+    def update(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        return Response({
+            'message': 'Password changed successfully'
+        }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def logout_view(request):
+    """Выход пользователя"""
+    try:
+        refresh_token = request.data.get('refresh_token')
+        if refresh_token:
+            token = RefreshToken(refresh_token)
+            token.blacklist()
+        return Response({
+            'message': 'Logout successful'
+        }, status=status.HTTP_200_OK)
+    except Exception:
+        return Response({
+            'error': 'Invalid token'
+        }, status=status.HTTP_400_BAD_REQUEST)

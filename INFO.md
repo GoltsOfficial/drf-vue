@@ -47,6 +47,7 @@ class User(AbstractUser):
 ```python
 from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
+
 from .models import User
 
 
@@ -939,3 +940,815 @@ urlpatterns = [
 ]
 
 ```
+
+# 📘 Django (DRF) + Vue — Этап: Основное приложение (Main)
+
+---
+
+## 🔹 Часть 1. Модель `Category`
+
+```python
+from django.db import models
+from django.utils.text import slugify
+
+
+class Category(models.Model):
+    """Модель категории для постов блога"""
+    name = models.CharField(max_length=100, unique=True)  # название категории (уникальное)
+    slug = models.SlugField(max_length=100, unique=True, blank=True)  # URL-имя (заполнится автоматически)
+    description = models.TextField(blank=True)  # описание (необязательное)
+    created_at = models.DateTimeField(auto_now_add=True)  # дата создания (ставится 1 раз)
+
+    class Meta:
+        db_table = 'categories'  # имя таблицы в БД
+        verbose_name = 'Category'  # человекочитаемое имя (ед. ч.)
+        verbose_name_plural = 'Categories'  # человекочитаемое имя (мн. ч.)
+        ordering = ['name']  # сортировка по умолчанию — по имени
+
+    def __str__(self):
+        return self.name  # строковое представление — имя категории
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = slugify(self.name)  # автогенерация slug из имени (если не задан)
+        super().save(*args, **kwargs)
+```
+
+**Пример queryset:** `Category.objects.all()` → `<QuerySet [<Category: Tech>, <Category: Life>]>`
+
+---
+
+## 🔹 Часть 2. Менеджер `PostManager`
+
+```python
+class PostManager(models.Manager):
+    """Менеджер для модели Post с дополнительными методами"""
+
+    def published(self):
+        return self.filter(status='published')  # только опубликованные посты
+
+    def pinned_posts(self):
+        """Закреплённые посты с активной подпиской автора"""
+        return self.filter(
+            pin_info__isnull=False,  # есть запись о закреплении
+            pin_info__user__subscription__status='active',  # подписка активна
+            pin_info__user__subscription__end_date__gt=models.functions.Now(),  # не истекла
+            status='published'  # пост опубликован
+        ).order_by('pin_info__pinned_at')  # сортировка по дате закрепления
+
+    def with_subscription_info(self):
+        """Оптимизация: подтягиваем связанные данные одним запросом"""
+        return self.select_related(
+            'author', 'author__subscription', 'category'  # JOIN по author, subscription, category
+        ).prefetch_related('pin_info')  # отдельный запрос для pin_info
+```
+
+**Пример queryset:** `Post.objects.published()` → `<QuerySet [<Post: Django tips>, ...]>`
+
+---
+
+## 🔹 Часть 3. Модель `Post`
+
+```python
+class Post(models.Model):
+    """Модель поста блога с поддержкой закрепления"""
+    STATUS_CHOICES = [
+        ('draft', 'Draft'),  # черновик
+        ('published', 'Published'),  # опубликован
+    ]
+
+    title = models.CharField(max_length=200)  # заголовок поста
+    slug = models.SlugField(max_length=200, unique=True, blank=True)  # URL-имя (автогенерация)
+    content = models.TextField()  # содержимое поста
+    image = models.ImageField(upload_to='posts/', blank=True, null=True)  # картинка (необязательна)
+    category = models.ForeignKey(
+        Category, on_delete=models.SET_NULL,  # при удалении категории — NULL
+        null=True, blank=True, related_name='posts'  # обратная связь: category.posts
+    )
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,  # при удалении автора — удалить посты
+        related_name='posts'  # обратная связь: author.posts
+    )
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='published')  # статус
+    created_at = models.DateTimeField(auto_now_add=True)  # дата создания (1 раз)
+    updated_at = models.DateTimeField(auto_now=True)  # дата обновления (каждый save)
+    views_count = models.PositiveIntegerField(default=0)  # счётчик просмотров
+
+    objects = PostManager()  # кастомный менеджер
+
+    class Meta:
+        db_table = 'posts'  # имя таблицы в БД
+        verbose_name = 'Post'
+        verbose_name_plural = 'Posts'
+        ordering = ['-created_at']  # сортировка по умолчанию — новые сверху
+        indexes = [  # индексы для быстрых запросов
+            models.Index(fields=['-created_at']),  # по дате
+            models.Index(fields=['status', '-created_at']),  # по статусу + дате
+            models.Index(fields=['category', '-created_at']),  # по категории + дате
+            models.Index(fields=['author', '-created_at']),  # по автору + дате
+        ]
+
+    def __str__(self):
+        return self.title  # строковое представление — заголовок
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = slugify(self.title)  # автогенерация slug из заголовка
+        super().save(*args, **kwargs)
+
+    def get_absolute_url(self):
+        return reverse('post-detail', kwargs={'slug': self.slug})  # URL поста по slug
+
+    @property
+    def comments_count(self):
+        """Количество активных комментариев"""
+        return self.comments.filter(is_active=True).count()  # только активные
+
+    @property
+    def is_pinned(self):
+        """Проверяет, закреплён ли пост"""
+        return hasattr(self, 'pin_info') and self.pin_info is not None  # есть запись о закреплении
+
+    def can_be_pinned_by(self, user):
+        """Может ли пользователь закрепить этот пост"""
+        if not user or not user.is_authenticated:  # не авторизован → нет
+            return False
+        if self.author != user:  # не автор → нет
+            return False
+        if self.status != 'published':  # не опубликован → нет
+            return False
+        if not hasattr(user, 'subscription') or not user.subscription.is_active:  # нет подписки → нет
+            return False
+        return True  # все условия выполнены
+
+    def increment_views(self):
+        """Увеличивает счётчик просмотров на 1"""
+        self.views_count += 1
+        self.save(update_fields=['views_count'])  # сохраняем только поле views_count
+
+    def get_pinned_info(self):
+        """Возвращает информацию о закреплении"""
+        if self.is_pinned:
+            return {
+                'is_pinned': True,
+                'pinned_at': self.pin_info.pinned_at,  # дата закрепления
+                'pinned_by': {
+                    'id': self.pin_info.user.id,
+                    'username': self.pin_info.user.username,
+                    'has_active_subscription': self.pin_info.user.subscription.is_active
+                }
+            }
+        return {'is_pinned': False}  # не закреплён
+```
+
+**Пример queryset:** `Post.objects.pinned_posts()` → `<QuerySet [<Post: Django tips>]>`
+
+---
+
+## 🔹 Часть 4. Сериализаторы
+
+### 📌 `CategorySerializer`
+
+```python
+class CategorySerializer(serializers.ModelSerializer):
+    """Сериализатор для категорий"""
+    posts_count = serializers.SerializerMethodField()  # вычисляемое поле: количество постов
+
+    class Meta:
+        model = Category
+        fields = ['id', 'name', 'slug', 'description', 'posts_count', 'created_at']
+        read_only_fields = ['slug', 'created_at']  # нельзя менять вручную
+
+    def get_posts_count(self, obj):
+        return obj.posts.filter(status='published').count()  # только опубликованные
+
+    def create(self, validated_data):
+        validated_data['slug'] = slugify(validated_data['name'])  # автогенерация slug
+        return super().create(validated_data)
+```
+
+#### 🧪 Пример ответа (200 OK)
+
+```json
+{
+  "id": 1,
+  "name": "Tech",
+  "slug": "tech",
+  "description": "Технологии",
+  "posts_count": 12,
+  "created_at": "2026-10-03T12:00:00Z"
+}
+```
+
+---
+
+### 📌 `PostListSerializer` — список
+
+```python
+class PostListSerializer(serializers.ModelSerializer):
+    """Сериализатор для списка постов"""
+    author = serializers.StringRelatedField()  # имя автора строкой
+    category = serializers.StringRelatedField()  # имя категории строкой
+    comments_count = serializers.ReadOnlyField()  # берётся из @property модели
+    is_pinned = serializers.ReadOnlyField()  # берётся из @property модели
+    pinned_info = serializers.SerializerMethodField()  # детали закрепления
+
+    class Meta:
+        model = Post
+        fields = [
+            'id', 'title', 'slug', 'content', 'image', 'category',
+            'author', 'status', 'created_at', 'updated_at',
+            'views_count', 'comments_count', 'is_pinned', 'pinned_info'
+        ]
+        read_only_fields = ['slug', 'author', 'views_count']  # нельзя менять
+
+    def get_pinned_info(self, obj):
+        return obj.get_pinned_info()  # берём из метода модели
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if len(data['content']) > 200:
+            data['content'] = data['content'][:200] + '...'  # обрезаем контент для списка
+        return data
+```
+
+---
+
+### 📌 `PostDetailSerializer` — детально
+
+```python
+class PostDetailSerializer(serializers.ModelSerializer):
+    """Сериализатор для детального просмотра поста"""
+    author_info = serializers.SerializerMethodField()  # расширенные данные автора
+    category_info = serializers.SerializerMethodField()  # расширенные данные категории
+    comments_count = serializers.ReadOnlyField()  # из @property
+    is_pinned = serializers.ReadOnlyField()  # из @property
+    pinned_info = serializers.SerializerMethodField()  # детали закрепления
+    can_pin = serializers.SerializerMethodField()  # может ли текущий user закрепить
+
+    class Meta:
+        model = Post
+        fields = [
+            'id', 'title', 'slug', 'content', 'image', 'category',
+            'category_info', 'author', 'author_info', 'status',
+            'created_at', 'updated_at', 'views_count', 'comments_count',
+            'is_pinned', 'pinned_info', 'can_pin'
+        ]
+        read_only_fields = ['slug', 'author', 'views_count']
+
+    def get_author_info(self, obj):
+        author = obj.author
+        return {
+            'id': author.id,
+            'username': author.username,
+            'full_name': author.full_name,  # из @property модели User
+            'avatar': author.avatar.url if author.avatar else None  # URL аватара
+        }
+
+    def get_category_info(self, obj):
+        if obj.category:
+            return {
+                'id': obj.category.id,
+                'name': obj.category.name,
+                'slug': obj.category.slug,
+            }
+        return None  # если категории нет
+
+    def get_pinned_info(self, obj):
+        return obj.get_pinned_info()  # берём из метода модели
+
+    def get_can_pin(self, obj):
+        request = self.context.get('request')  # текущий запрос
+        if not request or not request.user.is_authenticated:
+            return False
+        return obj.can_be_pinned_by(request.user)  # проверяем права
+```
+
+---
+
+### 📌 `PostCreateUpdateSerializer` — создание/обновление
+
+```python
+class PostCreateUpdateSerializer(serializers.ModelSerializer):
+    """Сериализатор для создания и обновления постов"""
+
+    class Meta:
+        model = Post
+        fields = ['title', 'content', 'image', 'category', 'status']  # только эти поля
+
+    def create(self, validated_data):
+        validated_data['author'] = self.context['request'].user  # автор = текущий пользователь
+        validated_data['slug'] = slugify(validated_data['title'])  # автогенерация slug
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if 'title' in validated_data:
+            validated_data['slug'] = slugify(validated_data['title'])  # пересоздаём slug
+        return super().update(instance, validated_data)
+```
+
+---
+
+## 🔹 Часть 5. Permissions
+
+```python
+from rest_framework import permissions
+
+
+class IsAuthorOrReadOnly(permissions.BasePermission):
+    """Разрешение: редактировать может только автор, читать — все"""
+
+    def has_object_permission(self, request, view, obj):
+        if request.method in permissions.SAFE_METHODS:  # GET, HEAD, OPTIONS — всем
+            return True
+        return obj.author == request.user  # запись — только автору
+```
+
+---
+
+## 🔹 Часть 6. Views
+
+### 📌 `CategoryListCreateView`
+
+```python
+class CategoryListCreateView(generics.ListCreateAPIView):
+    """API endpoint для категорий"""
+    queryset = Category.objects.all()  # все категории
+    serializer_class = CategorySerializer  # какой сериализатор
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]  # чтение всем, запись — авториз.
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]  # поиск + сортировка
+    search_fields = ['name', 'description']  # по каким полям искать
+    ordering_fields = ['name', 'created_at']  # по каким полям сортировать
+    ordering = ['name']  # сортировка по умолчанию
+```
+
+---
+
+### 📌 `CategoryDetailView`
+
+```python
+class CategoryDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """API endpoint для конкретной категории"""
+    queryset = Category.objects.all()  # все категории
+    serializer_class = CategorySerializer  # сериализатор
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]  # чтение всем
+    lookup_field = 'slug'  # ищем по slug, а не по pk
+```
+
+---
+
+### 📌 `PostListCreateView`
+
+```python
+class PostListCreateView(generics.ListCreateAPIView):
+    """
+    API endpoint для постов с поддержкой закреплённых постов.
+    Закреплённые посты отображаются первыми.
+    """
+    serializer_class = PostListSerializer  # сериализатор по умолчанию
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]  # чтение всем
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ['category', 'author', 'status']  # фильтрация по полям
+    search_fields = ['title', 'content']  # поиск по тексту
+    ordering_fields = ['created_at', 'updated_at', 'views_count', 'title']  # сортировка
+    ordering = ['-created_at']  # новые сверху
+
+    def get_queryset(self):
+        """Возвращает посты с учётом прав доступа"""
+        queryset = Post.objects.select_related('author', 'category')  # оптимизация JOIN
+
+        # Фильтрация по правам
+        if not self.request.user.is_authenticated:
+            queryset = queryset.filter(status='published')  # аноним — только опубликованные
+        else:
+            queryset = queryset.filter(
+                Q(status='published') | Q(author=self.request.user)  # свои + опубликованные
+            )
+
+        # Если сортировка не задана — показываем закреплённые первыми
+        ordering = self.request.query_params.get('ordering', '')
+        show_pinned_first = not ordering or ordering in ['-created_at', 'created_at']
+
+        if show_pinned_first:
+            return Post.get_posts_for_feed().filter(
+                Q(status='published') | (
+                    Q(author=self.request.user) if self.request.user.is_authenticated else Q()
+                )
+            )
+        return queryset
+
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return PostCreateUpdateSerializer  # при создании — свой сериализатор
+        return PostListSerializer  # при чтении — список
+
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+
+        # Добавляем статистику закреплённых
+        if hasattr(response, 'data') and 'results' in response.data:
+            pinned_count = sum(1 for post in response.data['results'] if post.get('is_pinned', False))
+            response.data['pinned_posts_count'] = pinned_count  # сколько закреплённых
+
+        return response
+```
+
+---
+
+### 📌 `PostDetailView`
+
+```python
+class PostDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """API endpoint для конкретного поста"""
+    queryset = Post.objects.select_related('author', 'category')  # оптимизация
+    serializer_class = PostDetailSerializer  # сериализатор по умолчанию
+    permission_classes = [IsAuthorOrReadOnly]  # только автор может править
+    lookup_field = 'slug'  # ищем по slug
+
+    def get_serializer_class(self):
+        if self.request.method in ['PUT', 'PATCH']:
+            return PostCreateUpdateSerializer  # при обновлении — свой сериализатор
+        return PostDetailSerializer  # при чтении — детальный
+
+    def retrieve(self, request, *args, **kwargs):
+        """Увеличивает счётчик просмотров при GET"""
+        instance = self.get_object()
+        if request.method == 'GET':
+            instance.increment_views()  # +1 к просмотрам
+        serializer = self.get_serializer(instance)
+        return Response(serializer.data)
+```
+
+---
+
+### 📌 `MyPostsView`
+
+```python
+class MyPostsView(generics.ListAPIView):
+    """API endpoint для постов текущего пользователя"""
+    serializer_class = PostListSerializer  # сериализатор списка
+    permission_classes = [permissions.IsAuthenticated]  # только авторизованные
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ['category', 'status']  # фильтрация
+    search_fields = ['title', 'content']  # поиск
+    ordering_fields = ['created_at', 'updated_at', 'views_count', 'title']  # сортировка
+    ordering = ['-created_at']  # новые сверху
+
+    def get_queryset(self):
+        return Post.objects.filter(
+            author=self.request.user  # только посты текущего пользователя
+        ).select_related('author', 'category')  # оптимизация
+```
+
+---
+
+### 📌 Функциональные views
+
+```python
+@api_view(['GET'])  # только GET
+@permission_classes([permissions.AllowAny])  # доступ всем
+def post_by_category(request, category_slug):
+    """Посты определённой категории"""
+    category = get_object_or_404(Category, slug=category_slug)  # 404 если нет
+    posts = Post.objects.with_subscription_info().filter(  # оптимизация
+        category=category,
+        status='published'
+    )
+    serializer = PostListSerializer(posts, many=True, context={'request': request})
+    return Response({
+        'category': CategorySerializer(category).data,  # данные категории
+        'posts': serializer.data,  # список постов
+        'pinned_posts_count': sum(1 for post in serializer.data if post.get('is_pinned', False))
+    })
+
+
+@api_view(['GET'])
+@permission_classes([permissions.AllowAny])
+def popular_posts(request):
+    """10 самых популярных постов"""
+    posts = Post.objects.with_subscription_info().filter(
+        status='published'  # только опубликованные
+    ).order_by('-views_count')[:10]  # топ-10 по просмотрам
+    serializer = PostListSerializer(posts, many=True, context={'request': request})
+    return Response(serializer.data)
+
+
+@api_view(['GET'])
+@permission_classes([permissions.AllowAny])
+def recent_posts(request):
+    """10 последних опубликованных постов"""
+    posts = Post.objects.with_subscription_info().filter(
+        status='published'
+    ).order_by('-created_at')[:10]  # топ-10 по дате
+    serializer = PostListSerializer(posts, many=True, context={'request': request})
+    return Response(serializer.data)
+
+
+@api_view(['GET'])
+@permission_classes([permissions.AllowAny])
+def pinned_posts_only(request):
+    """Только закреплённые посты"""
+    posts = Post.objects.pinned_posts()  # из кастомного менеджера
+    serializer = PostListSerializer(posts, many=True, context={'request': request})
+    return Response({
+        'count': posts.count(),  # сколько всего
+        'results': serializer.data  # список
+    })
+
+
+@api_view(['GET'])
+@permission_classes([permissions.AllowAny])
+def featured_posts(request):
+    """Рекомендуемые посты для главной: закреплённые + популярные за неделю"""
+    from django.utils import timezone
+    from datetime import timedelta
+
+    pinned_posts = Post.objects.pinned_posts()[:3]  # 3 закреплённых
+    week_ago = timezone.now() - timedelta(days=7)  # неделя назад
+    popular_posts = Post.objects.with_subscription_info().filter(
+        status='published',
+        created_at__gte=week_ago  # за последнюю неделю
+    ).exclude(
+        id__in=[post.id for post in pinned_posts]  # исключаем уже закреплённые
+    ).order_by('-views_count')[:6]  # топ-6
+
+    return Response({
+        'pinned_posts': PostListSerializer(pinned_posts, many=True, context={'request': request}).data,
+        'popular_posts': PostListSerializer(popular_posts, many=True, context={'request': request}).data,
+        'total_pinned': Post.objects.pinned_posts().count()  # всего закреплённых
+    })
+
+
+@api_view(['POST'])  # только POST
+@permission_classes([permissions.IsAuthenticated])  # только авторизованные
+def toggle_post_pin_status(request, slug):
+    """Переключает статус закрепления поста"""
+    post = get_object_or_404(Post, slug=slug, author=request.user, status='published')
+
+    # Проверяем подписку
+    if not hasattr(request.user, 'subscription') or not request.user.subscription.is_active:
+        return Response({
+            'error': 'Active subscription required to pin posts'
+        }, status=status.HTTP_403_FORBIDDEN)  # нет подписки → 403
+
+    try:
+        from apps.subscribe.models import PinnedPost
+
+        if post.is_pinned:
+            post.pin_info.delete()  # открепляем
+            message, is_pinned = 'Post unpinned successfully', False
+        else:
+            if hasattr(request.user, 'pinned_post'):
+                request.user.pinned_post.delete()  # удаляем старый закреп
+            PinnedPost.objects.create(user=request.user, post=post)  # закрепляем новый
+            message, is_pinned = 'Post pinned successfully', True
+
+        return Response({
+            'message': message,
+            'is_pinned': is_pinned,
+            'post': PostDetailSerializer(post, context={'request': request}).data
+        })
+    except Exception as e:
+        return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)  # 400 при ошибке
+```
+
+---
+
+## 🔹 Часть 7. URLs
+
+```python
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    # Categories
+    path('categories/', views.CategoryListCreateView.as_view(), name='category-list'),  # список + создание
+    path('categories/<slug:slug>/', views.CategoryDetailView.as_view(), name='category-detail'),  # детали
+    path('categories/<slug:category_slug>/posts/', views.post_by_category, name='posts-by-category'),  # посты категории
+
+    # Posts
+    path('', views.PostListCreateView.as_view(), name='post-list'),  # список + создание
+    path('my-posts/', views.MyPostsView.as_view(), name='my-posts'),  # мои посты
+    path('popular/', views.popular_posts, name='popular-posts'),  # популярные
+    path('pinned/', views.pinned_posts_only, name='pinned-posts-only'),  # закреплённые
+    path('featured/', views.featured_posts, name='featured-posts'),  # рекомендуемые
+    path('recent/', views.recent_posts, name='recent-posts'),  # последние
+    path('<slug:slug>/', views.PostDetailView.as_view(), name='post-detail'),  # детали поста
+]
+```
+
+---
+
+## ✅ Итог этапа
+
+| Компонент                    | Назначение                  | Endpoint                                     |
+|------------------------------|-----------------------------|----------------------------------------------|
+| `Category` (модель)          | Категории блога             | —                                            |
+| `Post` (модель)              | Посты блога                 | —                                            |
+| `PostManager`                | Кастомные запросы           | —                                            |
+| `CategorySerializer`         | Сериализация категорий      | —                                            |
+| `PostListSerializer`         | Список постов               | —                                            |
+| `PostDetailSerializer`       | Детальный пост              | —                                            |
+| `PostCreateUpdateSerializer` | Создание/обновление         | —                                            |
+| `IsAuthorOrReadOnly`         | Права доступа               | —                                            |
+| `CategoryListCreateView`     | Список + создание категорий | `GET/POST /api/v1/categories/`               |
+| `CategoryDetailView`         | Детали категории            | `GET/PUT/DELETE /api/v1/categories/<slug>/`  |
+| `PostListCreateView`         | Список + создание постов    | `GET/POST /api/v1/posts/`                    |
+| `PostDetailView`             | Детали поста                | `GET/PUT/DELETE /api/v1/posts/<slug>/`       |
+| `MyPostsView`                | Мои посты                   | `GET /api/v1/posts/my-posts/`                |
+| `post_by_category`           | Посты категории             | `GET /api/v1/posts/categories/<slug>/posts/` |
+| `popular_posts`              | Популярные                  | `GET /api/v1/posts/popular/`                 |
+| `recent_posts`               | Последние                   | `GET /api/v1/posts/recent/`                  |
+| `pinned_posts_only`          | Только закреплённые         | `GET /api/v1/posts/pinned/`                  |
+| `featured_posts`             | Рекомендуемые               | `GET /api/v1/posts/featured/`                |
+| `toggle_post_pin_status`     | Закрепить/открепить         | `POST /api/v1/posts/<slug>/pin/`             |
+
+# 📘 Django (DRF) + Vue — Справочник: библиотеки и методы (Main)
+
+> Что именно использовалось в приложении `main` — по файлам и блокам.
+
+---
+
+## 🔹 1. Импорты в `views.py`
+
+| Импорт                          | Откуда                          | Что даёт                                                                                    |
+|---------------------------------|---------------------------------|---------------------------------------------------------------------------------------------|
+| `generics`                      | `rest_framework`                | Готовые CBV (`ListAPIView`, `CreateAPIView`, `RetrieveUpdateDestroyAPIView`…)               |
+| `permissions`                   | `rest_framework`                | Классы доступа (`AllowAny`, `IsAuthenticated`, `IsAuthenticatedOrReadOnly`)                 |
+| `status`                        | `rest_framework`                | HTTP-коды (`HTTP_200_OK`, `HTTP_201_CREATED`, `HTTP_403_FORBIDDEN`, `HTTP_400_BAD_REQUEST`) |
+| `filters`                       | `rest_framework`                | `SearchFilter`, `OrderingFilter` — поиск и сортировка                                       |
+| `api_view`                      | `rest_framework.decorators`     | Декоратор для функциональных views                                                          |
+| `permission_classes`            | `rest_framework.decorators`     | Декоратор для указания прав на функцию                                                      |
+| `Response`                      | `rest_framework.response`       | Формирование JSON-ответа                                                                    |
+| `DjangoFilterBackend`           | `django_filters.rest_framework` | Фильтрация по полям через `?field=value`                                                    |
+| `Q`                             | `django.db.models`              | Логические условия `OR` / `AND` в запросах                                                  |
+| `get_object_or_404`             | `django.shortcuts`              | Получить объект или вернуть 404                                                             |
+| `Case`, `When`, `Value`         | `django.db.models`              | Условная аннотация (для сортировки закреплённых)                                            |
+| `DateTimeField`, `BooleanField` | `django.db.models`              | Типы для `output_field`                                                                     |
+| `timezone`                      | `django.utils`                  | Работа с датами (`timezone.now()`)                                                          |
+| `timedelta`                     | `datetime`                      | Вычисления интервалов (неделя назад)                                                        |
+
+---
+
+## 🔹 2. Методы и атрибуты DRF
+
+### В `generics.*`
+
+| Метод / атрибут          | Что даёт                                              |
+|--------------------------|-------------------------------------------------------|
+| `queryset`               | Базовый набор объектов из БД                          |
+| `serializer_class`       | Какой сериализатор использовать                       |
+| `permission_classes`     | Кто имеет доступ                                      |
+| `filter_backends`        | Какие фильтры применять                               |
+| `filterset_fields`       | По каким полям фильтровать (`?category=1`)            |
+| `search_fields`          | По каким полям искать (`?search=django`)              |
+| `ordering_fields`        | По каким полям сортировать (`?ordering=-views_count`) |
+| `ordering`               | Сортировка по умолчанию                               |
+| `lookup_field`           | По какому полю искать объект (`slug` вместо `pk`)     |
+| `get_queryset()`         | Динамический queryset (переопределяем)                |
+| `get_serializer_class()` | Динамический сериализатор по методу                   |
+| `get_object()`           | Получить один объект                                  |
+| `list()`                 | Переопределение ответа для списка                     |
+| `retrieve()`             | Переопределение ответа для одного объекта             |
+| `perform_create()`       | Хук при создании                                      |
+| `perform_update()`       | Хук при обновлении                                    |
+| `perform_destroy()`      | Хук при удалении                                      |
+
+### В `serializers.*`
+
+| Метод / атрибут           | Что даёт                                       |
+|---------------------------|------------------------------------------------|
+| `SerializerMethodField()` | Поле, вычисляемое методом `get_<field>`        |
+| `ReadOnlyField()`         | Поле только для чтения (из `@property` модели) |
+| `StringRelatedField()`    | Строковое представление связанного объекта     |
+| `to_representation()`     | Переопределение финального вывода              |
+| `validate()`              | Общая валидация                                |
+| `validate_<field>()`      | Валидация конкретного поля                     |
+| `create()`                | Логика создания                                |
+| `update()`                | Логика обновления                              |
+| `context['request']`      | Доступ к запросу внутри сериализатора          |
+
+### В `permissions.*`
+
+| Класс / метод             | Что даёт                                 |
+|---------------------------|------------------------------------------|
+| `BasePermission`          | Базовый класс для своих правил           |
+| `has_permission()`        | Доступ ко всему view                     |
+| `has_object_permission()` | Доступ к конкретному объекту             |
+| `SAFE_METHODS`            | `GET`, `HEAD`, `OPTIONS` — только чтение |
+
+---
+
+## 🔹 3. Методы моделей `Post` / `Category`
+
+### `Post`
+
+| Метод / свойство               | Что даёт                             |
+|--------------------------------|--------------------------------------|
+| `save()`                       | Автогенерация `slug` через `slugify` |
+| `get_absolute_url()`           | URL объекта через `reverse()`        |
+| `comments_count` (`@property`) | Количество активных комментариев     |
+| `is_pinned` (`@property`)      | Закреплён ли пост                    |
+| `can_be_pinned_by(user)`       | Может ли пользователь закрепить      |
+| `increment_views()`            | +1 к `views_count`                   |
+| `get_pinned_info()`            | Словарь с данными о закреплении      |
+| `objects`                      | Кастомный `PostManager`              |
+
+### `PostManager`
+
+| Метод                      | Что даёт                                              |
+|----------------------------|-------------------------------------------------------|
+| `published()`              | Только `status='published'`                           |
+| `pinned_posts()`           | Закреплённые с активной подпиской                     |
+| `with_subscription_info()` | `select_related` + `prefetch_related` для оптимизации |
+
+### `Category`
+
+| Метод       | Что даёт             |
+|-------------|----------------------|
+| `save()`    | Автогенерация `slug` |
+| `__str__()` | Возвращает `name`    |
+
+---
+
+## 🔹 4. Декораторы
+
+| Декоратор                    | Что даёт                                  |
+|------------------------------|-------------------------------------------|
+| `@api_view(['GET'])`         | Превращает функцию в DRF-view             |
+| `@permission_classes([...])` | Задаёт права для функционального view     |
+| `@property`                  | Делает метод вычисляемым свойством модели |
+| `@admin.register(Model)`     | Регистрирует модель в админке             |
+
+---
+
+## 🔹 5. Функции утилит
+
+| Функция                         | Откуда              | Что даёт                                     |
+|---------------------------------|---------------------|----------------------------------------------|
+| `slugify()`                     | `django.utils.text` | Превращает `"Django Tips"` → `"django-tips"` |
+| `reverse()`                     | `django.urls`       | Строит URL по имени маршрута                 |
+| `get_object_or_404()`           | `django.shortcuts`  | Объект или 404                               |
+| `timezone.now()`                | `django.utils`      | Текущее время с учётом TZ                    |
+| `timedelta(days=7)`             | `datetime`          | Интервал «неделя»                            |
+| `Q()`                           | `django.db.models`  | Логические условия в фильтрах                |
+| `Case()` / `When()` / `Value()` | `django.db.models`  | Условная аннотация                           |
+| `models.functions.Now()`        | `django.db.models`  | SQL `NOW()`                                  |
+
+---
+
+## 🔹 6. Библиотеки (внешние)
+
+| Библиотека                      | Что даёт                                                  |
+|---------------------------------|-----------------------------------------------------------|
+| `djangorestframework`           | Основа API: views, serializers, permissions, status       |
+| `djangorestframework-simplejwt` | JWT-токены: `RefreshToken`, `TokenRefreshView`, blacklist |
+| `django-filter`                 | `DjangoFilterBackend` — фильтрация по полям               |
+| `Pillow`                        | Работа с `ImageField` (аватары, картинки постов)          |
+
+---
+
+## 🔹 7. Настройки в `settings.py` (что точно надо упомянуть)
+
+| Настройка                                                        | Что даёт                                              |
+|------------------------------------------------------------------|-------------------------------------------------------|
+| `AUTH_USER_MODEL = 'accounts.User'`                              | Кастомная модель пользователя                         |
+| `INSTALLED_APPS` — `accounts` первым                             | Миграции `accounts` применяются раньше `auth`/`admin` |
+| `REST_FRAMEWORK` → `DEFAULT_AUTHENTICATION_CLASSES`              | JWT по умолчанию                                      |
+| `REST_FRAMEWORK` → `DEFAULT_PERMISSION_CLASSES`                  | Права по умолчанию                                    |
+| `REST_FRAMEWORK` → `DEFAULT_PAGINATION_CLASS`, `PAGE_SIZE`       | Пагинация                                             |
+| `SIMPLE_JWT` → `ACCESS_TOKEN_LIFETIME`, `REFRESH_TOKEN_LIFETIME` | Время жизни токенов                                   |
+| `SIMPLE_JWT` → `BLACKLIST_AFTER_ROTATION`                        | Blacklist после ротации                               |
+| `MEDIA_URL`, `MEDIA_ROOT`                                        | Загрузка аватаров и картинок постов                   |
+
+---
+
+## 🔹 8. Что стоит упомянуть в `INFO.md` отдельно
+
+- **`select_related` / `prefetch_related`** — оптимизация запросов (убирает N+1).
+- **`Q()`** — логика `OR` / `AND` в фильтрах.
+- **`Case / When / Value`** — условная сортировка (закреплённые вверх).
+- **`to_representation()`** — обрезка контента для списка.
+- **`SerializerMethodField`** — вычисляемые поля (`can_pin`, `pinned_info`).
+- **`@property` в модели** — `is_pinned`, `comments_count`.
+- **Кастомный менеджер** `PostManager` — инкапсуляция частых запросов.
+- **`lookup_field = 'slug'`** — ЧПУ-URL вместо `pk`.
+- **`increment_views()`** — атомарное обновление счётчика.
+- **`permission_classes`** — `IsAuthenticatedOrReadOnly` + свой `IsAuthorOrReadOnly`.
+- **`filterset_fields` / `search_fields` / `ordering_fields`** — фильтрация, поиск, сортировка.
+- **Декораторы `@api_view` + `@permission_classes`** — для функциональных views.
+
+---
+
+## ✅ Итог
+
+| Категория      | Что упомянуть                                                                             |
+|----------------|-------------------------------------------------------------------------------------------|
+| **Импорты**    | `generics`, `permissions`, `filters`, `status`, `Q`, `Case/When`, `timezone`, `timedelta` |
+| **DRF-методы** | `get_queryset`, `get_serializer_class`, `perform_create`, `to_representation`             |
+| **Модели**     | `save()`, `@property`, кастомный менеджер                                                 |
+| **Утилиты**    | `slugify`, `reverse`, `get_object_or_404`                                                 |
+| **Библиотеки** | DRF, simplejwt, django-filter, Pillow                                                     |
+| **Настройки**  | `AUTH_USER_MODEL`, `REST_FRAMEWORK`, `SIMPLE_JWT`, `MEDIA_*`                              |
+
+

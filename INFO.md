@@ -1751,4 +1751,467 @@ urlpatterns = [
 | **Библиотеки** | DRF, simplejwt, django-filter, Pillow                                                     |
 | **Настройки**  | `AUTH_USER_MODEL`, `REST_FRAMEWORK`, `SIMPLE_JWT`, `MEDIA_*`                              |
 
+# 📘 Django (DRF) + Vue — Этап: Комментарии (Comments)
 
+---
+
+## 🔹 Часть 1. Модель `Comment`
+
+```python
+from django.conf import settings
+from django.db import models
+
+
+class Comment(models.Model):
+    """Модель комментария"""
+    post = models.ForeignKey(
+        'main.Post',  # ссылка на пост из приложения main
+        on_delete=models.CASCADE,  # при удалении поста — удалить комментарии
+        related_name='comments'  # обратная связь: post.comments
+    )
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,  # ссылка на кастомного User
+        on_delete=models.CASCADE,  # при удалении автора — удалить комментарии
+        related_name='comments'  # обратная связь: user.comments
+    )
+    parent = models.ForeignKey(
+        'self',  # ссылка на самого себя (ответы)
+        on_delete=models.CASCADE,
+        null=True, blank=True,  # может быть пустым (основной комментарий)
+        related_name='replies'  # обратная связь: comment.replies
+    )
+    content = models.TextField()  # текст комментария
+    is_active = models.BooleanField(default=True)  # флаг активности (мягкое удаление)
+    created_at = models.DateTimeField(auto_now_add=True)  # дата создания (1 раз)
+    updated_at = models.DateTimeField(auto_now=True)  # дата обновления (каждый save)
+
+    class Meta:
+        db_table = 'comments'  # имя таблицы в БД
+        verbose_name = 'Comment'
+        verbose_name_plural = 'Comments'
+        ordering = ['-created_at']  # сортировка по умолчанию — новые сверху
+        indexes = [  # индексы для быстрых запросов
+            models.Index(fields=['post', '-created_at']),  # по посту + дате
+            models.Index(fields=['author', '-created_at']),  # по автору + дате
+            models.Index(fields=['parent', '-created_at']),  # по родителю + дате
+        ]
+
+    def __str__(self):
+        return f'Comment by {self.author.username} on {self.post.title}'  # строковое представление
+
+    @property
+    def replies_count(self):
+        return self.replies.filter(is_active=True).count()  # количество активных ответов
+
+    @property
+    def is_reply(self):
+        return self.parent is not None  # является ли комментарий ответом
+```
+
+**Пример queryset:** `Comment.objects.filter(is_active=True)` →
+`<QuerySet [<Comment: Comment by ivan on Django tips>, ...]>`
+
+---
+
+## 🔹 Часть 2. Сериализаторы
+
+### 📌 `CommentSerializer` — базовый
+
+```python
+class CommentSerializer(serializers.ModelSerializer):
+    """Базовый сериализатор для комментариев"""
+    author_info = serializers.SerializerMethodField()  # расширенные данные автора
+    replies_count = serializers.ReadOnlyField()  # из @property модели
+    is_reply = serializers.ReadOnlyField()  # из @property модели
+
+    class Meta:
+        model = Comment
+        fields = [
+            'id', 'content', 'author', 'author_info', 'parent',
+            'is_active', 'replies_count', 'is_reply',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['author', 'is_active']  # нельзя менять вручную
+
+    def get_author_info(self, obj):
+        return {
+            'id': obj.author.id,
+            'username': obj.author.username,
+            'full_name': obj.author.full_name,  # из @property модели User
+            'avatar': obj.author.avatar.url if obj.author.avatar else None  # URL аватара
+        }
+```
+
+#### 🧪 Пример ответа (200 OK)
+
+```json
+{
+  "id": 1,
+  "content": "Отличный пост!",
+  "author": 2,
+  "author_info": {
+    "id": 2,
+    "username": "ivan",
+    "full_name": "Иван Иванов",
+    "avatar": "/media/avatars/ivan.png"
+  },
+  "parent": null,
+  "is_active": true,
+  "replies_count": 3,
+  "is_reply": false,
+  "created_at": "2026-10-05T12:00:00Z",
+  "updated_at": "2026-10-05T12:00:00Z"
+}
+```
+
+---
+
+### 📌 `CommentCreateSerializer` — создание
+
+```python
+class CommentCreateSerializer(serializers.ModelSerializer):
+    """Сериализатор для создания комментариев"""
+
+    class Meta:
+        model = Comment
+        fields = ['post', 'parent', 'content']
+
+    def validate_post(self, value):
+        """Пост должен быть опубликован"""
+        if not Post.objects.filter(id=value.id, status='published').exists():
+            raise serializers.ValidationError('Post not found')
+        return value
+
+    def validate_parent(self, value):
+        """Родительский комментарий должен быть из того же поста"""
+        if value:
+            post_data = self.initial_data.get('post')
+            if post_data:
+                if value.post.id != int(post_data):
+                    raise serializers.ValidationError(
+                        'Parent comment must belong to the same post.'
+                    )
+        return value
+
+    def create(self, validated_data):
+        validated_data['author'] = self.context['request'].user  # автор = текущий пользователь
+        return super().create(validated_data)
+```
+
+#### 🧪 Пример данных на вход
+
+```json
+POST /api/v1/comments/
+{
+  "post": 1,
+  "parent": null,
+  "content": "Отличный пост!"
+}
+```
+
+#### ❌ Пример ошибки (400 Bad Request)
+
+```json
+{
+  "parent": [
+    "Parent comment must belong to the same post."
+  ]
+}
+```
+
+---
+
+### 📌 `CommentUpdateSerializer` — обновление
+
+```python
+class CommentUpdateSerializer(serializers.ModelSerializer):
+    """Сериализатор для обновления комментариев"""
+
+    class Meta:
+        model = Comment
+        fields = ['content']  # можно менять только текст
+```
+
+---
+
+### 📌 `CommentDetailSerializer` — детально с ответами
+
+```python
+class CommentDetailSerializer(CommentSerializer):
+    """Детальный сериализатор комментария с ответами"""
+    replies = serializers.SerializerMethodField()  # вложенные ответы
+
+    class Meta(CommentSerializer.Meta):
+        fields = CommentSerializer.Meta.fields + ['replies']  # добавляем поле replies
+
+    def get_replies(self, obj):
+        if obj.parent is None:  # показываем ответы только для основных
+            replies = obj.replies.filter(is_active=True).order_by('created_at')
+            return CommentSerializer(replies, many=True, context=self.context).data
+        return []  # для ответов — пустой список
+```
+
+---
+
+## 🔹 Часть 3. Permissions
+
+```python
+from rest_framework import permissions
+
+
+class IsAuthorOrReadOnly(permissions.BasePermission):
+    """Разрешение: редактировать комментарий может только автор"""
+
+    def has_object_permission(self, request, view, obj):
+        if request.method in permissions.SAFE_METHODS:  # GET, HEAD, OPTIONS — всем
+            return True
+        return obj.author == request.user  # запись — только автору
+```
+
+---
+
+## 🔹 Часть 4. Views
+
+### 📌 `CommentListCreateView`
+
+```python
+class CommentListCreateView(generics.ListCreateAPIView):
+    """Список и создание комментариев"""
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]  # чтение всем, запись — авториз.
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ['post', 'author', 'parent']  # фильтрация по полям
+    search_fields = ['content']  # поиск по тексту
+    ordering_fields = ['created_at', 'updated_at']  # сортировка
+    ordering = ['-created_at']  # новые сверху
+
+    def get_queryset(self):
+        return Comment.objects.filter(is_active=True).select_related(  # только активные
+            'author', 'post', 'parent'  # оптимизация JOIN
+        )
+
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return CommentCreateSerializer  # при создании — свой сериализатор
+        return CommentSerializer  # при чтении — базовый
+```
+
+---
+
+### 📌 `CommentDetailView`
+
+```python
+class CommentDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """Детальный просмотр, обновление и удаление комментария"""
+    queryset = Comment.objects.filter(is_active=True).select_related('author', 'post')  # только активные
+    serializer_class = CommentDetailSerializer  # сериализатор по умолчанию
+    permission_classes = [IsAuthorOrReadOnly]  # править — только автор
+
+    def get_serializer_class(self):
+        if self.request.method in ['PUT', 'PATCH']:
+            return CommentUpdateSerializer  # при обновлении — свой сериализатор
+        return CommentDetailSerializer  # при чтении — детальный
+
+    def perform_destroy(self, instance):
+        instance.is_active = False  # мягкое удаление: помечаем неактивным
+        instance.save()
+```
+
+---
+
+### 📌 `MyCommentsView`
+
+```python
+class MyCommentsView(generics.ListAPIView):
+    """Список комментариев текущего пользователя"""
+    serializer_class = CommentSerializer  # базовый сериализатор
+    permission_classes = [permissions.IsAuthenticated]  # только авторизованные
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ['post', 'parent', 'is_active']  # фильтрация
+    search_fields = ['content']  # поиск
+    ordering_fields = ['created_at', 'updated_at']  # сортировка
+    ordering = ['-created_at']  # новые сверху
+
+    def get_queryset(self):
+        return Comment.objects.filter(author=self.request.user).select_related(  # только свои
+            'post', 'parent'  # оптимизация
+        )
+```
+
+---
+
+### 📌 Функциональные views
+
+```python
+@api_view(['GET'])  # только GET
+@permission_classes([permissions.AllowAny])  # доступ всем
+def post_comments(request, post_id):
+    """Получить комментарии к определённому посту"""
+    post = get_object_or_404(Post, id=post_id, status='published')  # 404 если нет
+
+    # Получаем только основные комментарии
+    comments = Comment.objects.filter(
+        post=post,
+        parent=None,  # только корневые
+        is_active=True  # только активные
+    ).select_related('author').prefetch_related(  # оптимизация
+        'replies__author'  # подтягиваем ответы и их авторов
+    ).order_by('-created_at')  # новые сверху
+
+    serializer = CommentDetailSerializer(comments, many=True, context={'request': request})
+    return Response({
+        'post': {
+            'id': post.id,
+            'title': post.title,
+            'slug': post.slug
+        },
+        'comments': serializer.data,  # список комментариев с ответами
+        'comments_count': post.comments.filter(is_active=True).count()  # всего активных
+    })
+
+
+@api_view(['GET'])
+@permission_classes([permissions.AllowAny])
+def comment_replies(request, comment_id):
+    """Получить ответы на комментарий"""
+    parent_comment = get_object_or_404(Comment, id=comment_id, is_active=True)  # 404 если нет
+
+    replies = Comment.objects.filter(
+        parent=parent_comment,  # только ответы этого комментария
+        is_active=True  # только активные
+    ).select_related('author').order_by('created_at')  # оптимизация + сортировка
+
+    serializer = CommentSerializer(replies, many=True, context={'request': request})
+    return Response({
+        'parent_comment': CommentSerializer(parent_comment, context={'request': request}).data,
+        'replies': serializer.data,  # список ответов
+        'replies_count': replies.count()  # сколько всего
+    })
+```
+
+---
+
+## 🔹 Часть 5. URLs
+
+```python
+from django.urls import path
+
+from . import views
+
+urlpatterns = [
+    path('', views.CommentListCreateView.as_view(), name='comment-list'),  # список + создание
+    path('<int:pk>/', views.CommentDetailView.as_view(), name='comment-detail'),  # детали
+    path('my-comments/', views.MyCommentsView.as_view(), name='my-comments'),  # мои комментарии
+    path('post/<int:post_id>/', views.post_comments, name='post-comments'),  # к посту
+    path('<int:comment_id>/replies/', views.comment_replies, name='comment-replies'),  # ответы
+]
+```
+
+---
+
+## 🔹 Часть 6. Admin
+
+```python
+@admin.register(Comment)
+class CommentAdmin(admin.ModelAdmin):
+    list_display = (
+        'id', 'post_title', 'author', 'content_preview',
+        'parent_comment', 'is_active', 'created_at'
+    )
+    list_filter = ('is_active', 'created_at', 'updated_at')
+    search_fields = ('content', 'author__username', 'post__title')
+    readonly_fields = ('created_at', 'updated_at')
+    raw_id_fields = ('author', 'post', 'parent')  # автокомплит вместо выпадающего списка
+    list_editable = ('is_active',)  # можно менять прямо из списка
+
+    fieldsets = (
+        (None, {'fields': ('post', 'author', 'parent', 'content')}),
+        ('Status', {'fields': ('is_active',)}),
+        ('Timestamps', {'fields': ('created_at', 'updated_at'), 'classes': ('collapse',)}),
+    )
+
+    def post_title(self, obj):
+        return obj.post.title
+
+    post_title.short_description = 'Post'
+
+    def content_preview(self, obj):
+        return obj.content[:50] + '...' if len(obj.content) > 50 else obj.content
+
+    content_preview.short_description = 'Content Preview'
+
+    def parent_comment(self, obj):
+        if obj.parent:
+            return f"Reply to: {obj.parent.content[:30]}..."
+        return "Main comment"
+
+    parent_comment.short_description = 'Parent'
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related('author', 'post', 'parent')  # оптимизация
+
+    actions = ['make_active', 'make_inactive']  # массовые действия
+
+    def make_active(self, request, queryset):
+        updated = queryset.update(is_active=True)
+        self.message_user(request, f'{updated} comments were marked as active.')
+
+    make_active.short_description = "Mark selected comments as active"
+
+    def make_inactive(self, request, queryset):
+        updated = queryset.update(is_active=False)
+        self.message_user(request, f'{updated} comments were marked as inactive.')
+
+    make_inactive.short_description = "Mark selected comments as inactive"
+```
+
+---
+
+## ✅ Итог этапа
+
+| Компонент                 | Назначение                    | Endpoint (пример)                             |
+|---------------------------|-------------------------------|-----------------------------------------------|
+| `Comment` (модель)        | Комментарии к постам          | —                                             |
+| `CommentSerializer`       | Базовый просмотр              | —                                             |
+| `CommentCreateSerializer` | Создание                      | —                                             |
+| `CommentUpdateSerializer` | Обновление                    | —                                             |
+| `CommentDetailSerializer` | Детально с ответами           | —                                             |
+| `IsAuthorOrReadOnly`      | Права доступа                 | —                                             |
+| `CommentListCreateView`   | Список + создание             | `GET/POST /api/v1/comments/`                  |
+| `CommentDetailView`       | Детали + редактирование + уд. | `GET/PUT/PATCH/DELETE /api/v1/comments/<pk>/` |
+| `MyCommentsView`          | Мои комментарии               | `GET /api/v1/comments/my-comments/`           |
+| `post_comments`           | Комментарии к посту           | `GET /api/v1/comments/post/<post_id>/`        |
+| `comment_replies`         | Ответы на комментарий         | `GET /api/v1/comments/<comment_id>/replies/`  |
+
+---
+
+## 🔹 Что стоит упомянуть отдельно
+
+- **`select_related` / `prefetch_related`** — оптимизация запросов (убирает N+1).
+    - `select_related('author', 'post', 'parent')` — JOIN по FK.
+    - `prefetch_related('replies__author')` — отдельные запросы для связанных.
+- **`get_object_or_404()`** — получить объект или 404.
+- **`SerializerMethodField()`** — вычисляемые поля (`author_info`, `replies`).
+- **`ReadOnlyField()`** — поля из `@property` модели (`replies_count`, `is_reply`).
+- **`perform_destroy()`** — мягкое удаление (`is_active = False`).
+- **`filterset_fields` / `search_fields` / `ordering_fields`** — фильтрация, поиск, сортировка.
+- **`IsAuthorOrReadOnly`** — свой permission: автор может править, все — читать.
+- **`raw_id_fields`** — автокомплит для FK в админке.
+- **`list_editable`** — редактирование поля прямо из списка в админке.
+- **`actions`** — массовые действия (`make_active`, `make_inactive`).
+
+---
+
+## 📚 Ссылки на документацию
+
+| Тема                    | Django                                                                                           | DRF                                                                             |
+|-------------------------|--------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------|
+| **Foreign Key**         | [Django FK](https://docs.djangoproject.com/en/5.2/ref/models/fields/#foreignkey)                 | —                                                                               |
+| **Self-referencing FK** | [Self FK](https://docs.djangoproject.com/en/5.2/ref/models/fields/#foreignkey)                   | —                                                                               |
+| **select_related**      | [select_related](https://docs.djangoproject.com/en/5.2/ref/models/querysets/#select-related)     | —                                                                               |
+| **prefetch_related**    | [prefetch_related](https://docs.djangoproject.com/en/5.2/ref/models/querysets/#prefetch-related) | —                                                                               |
+| **Serializers**         | —                                                                                                | [DRF Serializers](https://www.django-rest-framework.org/api-guide/serializers/) |
+| **Permissions**         | —                                                                                                | [DRF Permissions](https://www.django-rest-framework.org/api-guide/permissions/) |
+| **Filtering**           | —                                                                                                | [DRF Filtering](https://www.django-rest-framework.org/api-guide/filtering/)     |
+| **Admin actions**       | [Admin actions](https://docs.djangoproject.com/en/5.2/ref/contrib/admin/actions/)                | —                                                                               |
+
+**Следующий этап:** Subscribe — подписки и закрепление постов.

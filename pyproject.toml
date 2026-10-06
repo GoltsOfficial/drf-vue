@@ -15,4 +15,5 @@ dependencies = [
     "pyjwt>=2.15.1",
     "python-decouple>=3.8",
     "rest-framework-simplejwt>=0.0.2",
+    "stripe>=16.0.0",
 ]

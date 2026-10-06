@@ -1492,7 +1492,7 @@ def toggle_post_pin_status(request, slug):
         }, status=status.HTTP_403_FORBIDDEN)  # нет подписки → 403
 
     try:
-        from apps.subscribe.models import PinnedPost
+        from backend.apps.subscribe import PinnedPost
 
         if post.is_pinned:
             post.pin_info.delete()  # открепляем

@@ -4,7 +4,7 @@ from rest_framework import generics, permissions, filters
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
-from apps.main.models import Post
+from backend.apps.main.models import Post
 from .models import Comment
 from .permissions import IsAuthorOrReadOnly
 from .serializers import (

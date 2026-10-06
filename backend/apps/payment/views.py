@@ -9,7 +9,7 @@ from rest_framework import generics, permissions, status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
-from apps.subscribe.models import SubscriptionPlan
+from backend.apps.subscribe.models import SubscriptionPlan
 from .models import Payment, Refund
 from .serializers import (
     PaymentSerializer,

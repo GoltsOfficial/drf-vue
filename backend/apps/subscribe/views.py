@@ -5,7 +5,7 @@ from rest_framework import generics, permissions, status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
-from apps.main.models import Post
+from backend.apps.main.models import Post
 from .models import SubscriptionPlan, Subscription, PinnedPost, SubscriptionHistory
 from .serializers import (
     SubscriptionPlanSerializer,

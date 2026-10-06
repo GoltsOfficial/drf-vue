@@ -184,7 +184,7 @@ class PinPostSerializer(serializers.Serializer):
 
     def validate_post_id(self, value):
         """Валидация ID поста"""
-        from apps.main.models import Post
+        from backend.apps.main.models import Post
 
         try:
             post = Post.objects.get(id=value, status='published')

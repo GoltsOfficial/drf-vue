@@ -6,7 +6,7 @@ import stripe
 from django.conf import settings
 from django.utils import timezone
 
-from apps.subscribe.models import Subscription, SubscriptionPlan, SubscriptionHistory
+from backend.apps.subscribe.models import Subscription, SubscriptionPlan, SubscriptionHistory
 from .models import Payment, WebhookEvent
 
 logger = logging.getLogger(__name__)

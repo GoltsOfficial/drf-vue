@@ -58,7 +58,7 @@ class PaymentCreateSerializer(serializers.Serializer):
 
     def validate_subscription_plan_id(self, value):
         """Валидация тарифного плана"""
-        from apps.subscribe.models import SubscriptionPlan
+        from backend.apps.subscribe.models import SubscriptionPlan
 
         try:
             plan = SubscriptionPlan.objects.get(id=value, is_active=True)
